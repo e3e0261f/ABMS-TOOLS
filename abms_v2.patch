@@ -1,0 +1,1231 @@
+
+diff --git a/src/models.rs b/src/models.rs
+index 0000001..0000002 100644
+--- a/src/models.rs
++++ b/src/models.rs
+@@ -91,6 +91,7 @@ pub struct KillEvent {
+ #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+ #[serde(default, rename_all = "PascalCase")]
+ pub struct EventPlayer {
++    pub id: Option<String>,
+     pub name: String,
+     pub guild_id: Option<String>,
+     pub guild_name: Option<String>,
+@@ -103,8 +104,11 @@ pub struct EventPlayer {
+ #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+ #[serde(default, rename_all = "PascalCase")]
+ pub struct Participant {
++    pub id: Option<String>,
+     pub name: String,
+     pub guild_id: Option<String>,
+     pub guild_name: Option<String>,
++    pub alliance_id: Option<String>,
++    pub alliance_name: Option<String>,
+     pub average_item_power: Option<f64>,
+     pub damage_done: Option<f64>,
+     pub support_healing_done: Option<f64>,
+@@ -233,6 +237,7 @@ pub struct AllianceLossAgg {
+     pub alliance_display: String,
+     pub relation: Relation,
+     pub guilds: HashSet<String>,
++    pub participants: HashSet<String>,
+     pub deaths: u32,
+     pub cross_cost: u64,
+     pub full_cost: u64,
+@@ -250,6 +255,7 @@ pub struct GuildLossAgg {
+     pub alliance_display: String,
+     pub guild_name: String,
+     pub relation: Relation,
++    pub participants: HashSet<String>,
+     pub deaths: u32,
+     pub cross_cost: u64,
+     pub full_cost: u64,
+@@ -264,6 +270,7 @@ pub struct GuildLossAgg {
+ 
+ #[derive(Debug, Default)]
+ pub struct GuildMemberStats {
++    pub player_id: Option<String>,
+     pub name: String,
+     pub battles_attended: u32,
+     pub deaths: u32,
+@@ -291,3 +298,42 @@ pub struct EvaluatedEvent {
+     pub gear_eval: GearEval,
+     pub inv_eval: InvEval,
+ }
++
++#[derive(Debug, Clone)]
++pub struct CombatantStats {
++    pub player_id: Option<String>,
++    pub name: String,
++    pub guild_id: Option<String>,
++    pub guild_name: Option<String>,
++    pub alliance_id: Option<String>,
++    pub alliance_name: Option<String>,
++    pub relation: Relation,
++    pub alliance_key: String,
++    pub alliance_display: String,
++    pub kills: u32,
++    pub assists: u32,
++    pub deaths: u32,
++    pub heal_events: u32,
++    pub total_damage: f64,
++    pub total_healing: f64,
++    pub max_single_healing: f64,
++    pub main_hand: Option<String>,
++    pub avg_ip: Option<f64>,
++    pub sample_event_id: Option<u64>,
++}
++
++#[derive(Debug)]
++pub struct AllianceHealAgg {
++    pub alliance_display: String,
++    pub relation: Relation,
++    pub healer_count: u32,
++    pub healer_deaths: u32,
++    pub total_healing: f64,
++    pub top_healer_name: String,
++    pub top_healer_val: f64,
++}
+diff --git a/src/filter.rs b/src/filter.rs
+index 0000001..0000002 100644
+--- a/src/filter.rs
++++ b/src/filter.rs
+@@ -58,10 +58,12 @@ pub fn equivalent_tier_siblings(item_id: &str) -> (u8, Vec<String>) {
+     }
+ 
+     let equiv = tier + enchant;
++    // 非 .4 装备不混入高溢价 .4（例如 6.3 只用 7.2 / 8.1 求均价，不再被 5.4 拉高）
++    let max_e = if enchant >= 4 { 4 } else { 3 };
+     let mut siblings = Vec::new();
+     for t in 4u8..=8 {
+         if let Some(e) = equiv.checked_sub(t) {
+-            if e <= 4 && !(t == tier && e == enchant) {
++            if e <= max_e && !(t == tier && e == enchant) {
+                 let id = if e == 0 {
+                     format!("T{t}_{suffix}")
+                 } else {
+diff --git a/src/theme.rs b/src/theme.rs
+index 0000001..0000002 100644
+--- a/src/theme.rs
++++ b/src/theme.rs
+@@ -47,6 +47,22 @@ pub fn killboard_url(event_id: u64) -> String {
+     format!("https://albiononline.com/killboard/kill/{event_id}?server=live_sgp")
+ }
+ 
++pub fn player_url(player_id: &str) -> String {
++    format!("https://albiononline.com/killboard/player/{player_id}?server=live_sgp")
++}
++
++pub fn player_link(
++    player_id: Option<&str>,
++    fallback_event_id: Option<u64>,
++    label: &str,
++) -> String {
++    if let Some(pid) = player_id.map(str::trim).filter(|s| !s.is_empty()) {
++        osc8_link(&player_url(pid), label)
++    } else if let Some(eid) = fallback_event_id {
++        osc8_link(&killboard_url(eid), label)
++    } else {
++        label.to_string()
++    }
++}
++
+ pub fn osc8_link(url: &str, label: &str) -> String {
+     format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\")
+ }
+diff --git a/src/api.rs b/src/api.rs
+index 0000001..0000002 100644
+--- a/src/api.rs
++++ b/src/api.rs
+@@ -347,124 +347,50 @@ pub async fn fetch_prices_and_recent_trades(
+     }
+ 
+     let now = now_unix();
+-    let mut live_grouped: HashMap<(String, u8), Vec<(u64, Option<u64>)>> = HashMap::new();
+     let mut rate_limited = false;
++    let mut trade_added = 0usize;
+ 
+-    let chunks: Vec<&[String]> = unique_ids.chunks(60).collect();
+-    let total_chunks = chunks.len();
+-    for (ci, chunk) in chunks.into_iter().enumerate() {
+-        eprint!("\r  [联网] 查询皇家城实时买价: 第 {}/{} 批", ci + 1, total_chunks);
++    // 1. 优先查 /stats/history 真实成交均价（有 24h 内刚成交的用 [刚]，否则用近期成交量加权均价 [均]）
++    let h_chunks: Vec<&[String]> = unique_ids.chunks(40).collect();
++    let total_h = h_chunks.len();
++    for (hi, chunk) in h_chunks.into_iter().enumerate() {
++        eprint!("\r  [联网] 查询近期成交均价: 第 {}/{} 批", hi + 1, total_h);
+         let _ = io::stderr().flush();
+ 
+         let ids_param = chunk.join(",");
+-        let url = format!("{AODP_PRICE_BASE}/{ids_param}.json");
++        let url = format!("{AODP_HISTORY_BASE}/{ids_param}.json");
+         let resp = client
+             .get(url)
+-            .query(&[("locations", ROYAL_LOCATIONS), ("qualities", "1,2,3,4,5")])
++            .query(&[
++                ("locations", ROYAL_LOCATIONS),
++                ("qualities", "1,2,3,4,5"),
++                ("time-scale", "6"),
++            ])
+             .send()
+             .await?;
+ 
+         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+             let reset = resp
+                 .headers()
+                 .get("RateLimit-Reset")
+                 .and_then(|v| v.to_str().ok())
+                 .unwrap_or("未知");
+-            eprintln!("\n⚠️ 实时物价触发 429 (Reset: {reset})，自动改用本地数据库。");
++            eprintln!("\n⚠️ 成交历史接口触发 429 (Reset: {reset})，自动改用本地数据库。");
+             rate_limited = true;
+             break;
+         }
+-
+-        let records = resp.error_for_status()?.json::<Vec<AodpPrice>>().await?;
+-        for r in records {
+-            if r.sell_price_min > 0 {
+-                let ts = r.sell_price_min_date.as_deref().and_then(parse_iso_to_unix);
+-                live_grouped
+-                    .entry((r.item_id, r.quality))
+-                    .or_default()
+-                    .push((r.sell_price_min, ts));
+-            }
++        if !resp.status().is_success() {
++            continue;
+         }
+-    }
+-    if !rate_limited {
+-        eprintln!();
+-    }
+ 
+-    let mut updated_count = 0usize;
+-    for (key, entries) in live_grouped {
+-        let Some(buy_price) = pick_royal_buy_price(&entries, now) else {
++        let Ok(hist_list) = resp.json::<Vec<AodpHistoryResp>>().await else {
+             continue;
+         };
+-        live_prices.insert(key.clone(), buy_price);
+-
+-        let k_str = price_key(&key.0, key.1);
+-        let is_manual = db
+-            .prices
+-            .get(&k_str)
+-            .map(|r| r.source == "manual")
+-            .unwrap_or(false);
+-        if !is_manual {
+-            db.prices.insert(
+-                k_str,
+-                PriceRecord {
+-                    price: buy_price,
+-                    source: "live".to_string(),
+-                    updated_at: now,
+-                    tag: None,
+-                },
+-            );
+-            updated_count += 1;
+-        }
+-    }
+ 
+-    let mut trade_added = 0usize;
+-    if !rate_limited {
+-        let need_hist_ids: Vec<String> = unique_ids
+-            .into_iter()
+-            .filter(|id| !(1u8..=3).any(|q| live_prices.contains_key(&(id.clone(), q))))
+-            .collect();
+-
+-        let h_chunks: Vec<&[String]> = need_hist_ids.chunks(40).collect();
+-        let total_h = h_chunks.len();
+-        for (hi, chunk) in h_chunks.into_iter().enumerate() {
+-            eprint!("\r  [联网] 补充 48h 近期成交均价: 第 {}/{} 批", hi + 1, total_h);
+-            let _ = io::stderr().flush();
+-
+-            let ids_param = chunk.join(",");
+-            let url = format!("{AODP_HISTORY_BASE}/{ids_param}.json");
+-            let resp = client
+-                .get(url)
+-                .query(&[
+-                    ("locations", ROYAL_LOCATIONS),
+-                    ("qualities", "1,2,3,4,5"),
+-                    ("time-scale", "6"),
+-                ])
+-                .send()
+-                .await?;
+-
+-            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+-                eprintln!("\n⚠️ 历史成交接口触发 429，跳过剩余批次。");
+-                break;
+-            }
+-            if !resp.status().is_success() {
+-                continue;
+-            }
+-
+-            let Ok(hist_list) = resp.json::<Vec<AodpHistoryResp>>().await else {
+-                continue;
+-            };
+-
+-            let mut points_by_item: HashMap<(String, u8), Vec<(u64, u64, f64)>> = HashMap::new();
+-            for h in hist_list {
+-                for pt in h.data {
+-                    if pt.item_count > 0 && pt.avg_price > 0.0 {
+-                        let ts = pt.timestamp.as_deref().and_then(parse_iso_to_unix).unwrap_or(0);
+-                        points_by_item
+-                            .entry((h.item_id.clone(), h.quality))
+-                            .or_default()
+-                            .push((ts, pt.item_count, pt.avg_price));
+-                    }
++        let mut points_by_item: HashMap<(String, u8), Vec<(u64, u64, f64)>> = HashMap::new();
++        for h in hist_list {
++            for pt in h.data {
++                if pt.item_count > 0 && pt.avg_price > 0.0 {
++                    let ts = pt.timestamp.as_deref().and_then(parse_iso_to_unix).unwrap_or(0);
++                    points_by_item
++                        .entry((h.item_id.clone(), h.quality))
++                        .or_default()
++                        .push((ts, pt.item_count, pt.avg_price));
+                 }
+             }
++        }
+ 
+-            for (key, mut pts) in points_by_item {
+-                pts.sort_by(|a, b| b.0.cmp(&a.0));
+-                let newest_ts = pts[0].0;
+-                let window_start = newest_ts.saturating_sub(48 * 3600);
+-
+-                let mut total_vol = 0u64;
+-                let mut total_val = 0f64;
+-                for &(ts, count, avg_p) in pts.iter().take(16) {
+-                    if ts >= window_start || total_vol == 0 {
+-                        total_vol += count;
+-                        total_val += avg_p * (count as f64);
+-                    }
++        for (key, mut pts) in points_by_item {
++            pts.sort_by(|a, b| b.0.cmp(&a.0));
++            let newest_ts = pts[0].0;
++
++            // 全量近期成交量加权平均价
++            let mut total_vol = 0u64;
++            let mut total_val = 0f64;
++            for &(_, count, avg_p) in &pts {
++                total_vol += count;
++                total_val += avg_p * (count as f64);
++            }
++            if total_vol == 0 {
++                continue;
++            }
++            let avg_all = (total_val / (total_vol as f64)).round() as u64;
++
++            // 若 24 小时内有“刚刚成交”，取最新 12 小时内成交均价并标记 [刚]
++            let (chosen_price, source_name, tag_str) = if newest_ts >= now.saturating_sub(24 * 3600)
++            {
++                let fresh_start = newest_ts.saturating_sub(12 * 3600);
++                let mut f_vol = 0u64;
++                let mut f_val = 0f64;
++                for &(ts, count, avg_p) in &pts {
++                    if ts >= fresh_start {
++                        f_vol += count;
++                        f_val += avg_p * (count as f64);
++                    }
++                }
++                if f_vol > 0 {
++                    (
++                        (f_val / (f_vol as f64)).round() as u64,
++                        "recent_trade",
++                        "[刚]",
++                    )
++                } else {
++                    (avg_all, "avg_trade", "[均]")
+                 }
+-                if total_vol == 0 {
+-                    continue;
+-                }
+-                let weighted_price = (total_val / (total_vol as f64)).round() as u64;
+-                recent_trades.insert(key.clone(), weighted_price);
++            } else {
++                (avg_all, "avg_trade", "[均]")
++            };
++
++            recent_trades.insert(key.clone(), chosen_price);
+ 
+-                let k_str = price_key(&key.0, key.1);
+-                let is_manual = db
+-                    .prices
+-                    .get(&k_str)
+-                    .map(|r| r.source == "manual")
+-                    .unwrap_or(false);
+-                if !is_manual {
+-                    db.prices.insert(
+-                        k_str,
+-                        PriceRecord {
+-                            price: weighted_price,
+-                            source: "recent_trade".to_string(),
+-                            updated_at: now,
+-                            tag: None,
+-                        },
+-                    );
+-                    trade_added += 1;
+-                }
++            let k_str = price_key(&key.0, key.1);
++            let is_manual = db
++                .prices
++                .get(&k_str)
++                .map(|r| r.source == "manual")
++                .unwrap_or(false);
++            if !is_manual {
++                db.prices.insert(
++                    k_str,
++                    PriceRecord {
++                        price: chosen_price,
++                        source: source_name.to_string(),
++                        updated_at: now,
++                        tag: Some(tag_str.to_string()),
++                    },
++                );
++                trade_added += 1;
+             }
+         }
+-        if total_h > 0 {
+-            eprintln!();
++    }
++    if !rate_limited && total_h > 0 {
++        eprintln!();
++    }
++
++    // 2. 仅对完全没有历史成交记录的装备，才兜底查挂单卖价 [挂]
++    let mut updated_count = 0usize;
++    if !rate_limited {
++        let need_listing_ids: Vec<String> = unique_ids
++            .into_iter()
++            .filter(|id| !(1u8..=3).any(|q| recent_trades.contains_key(&(id.clone(), q))))
++            .collect();
++
++        if !need_listing_ids.is_empty() {
++            let mut live_grouped: HashMap<(String, u8), Vec<(u64, Option<u64>)>> = HashMap::new();
++            let chunks: Vec<&[String]> = need_listing_ids.chunks(60).collect();
++            let total_chunks = chunks.len();
++            for (ci, chunk) in chunks.into_iter().enumerate() {
++                eprint!("\r  [联网] 补充无成交记录装备挂单价: 第 {}/{} 批", ci + 1, total_chunks);
++                let _ = io::stderr().flush();
++
++                let ids_param = chunk.join(",");
++                let url = format!("{AODP_PRICE_BASE}/{ids_param}.json");
++                let resp = client
++                    .get(url)
++                    .query(&[("locations", ROYAL_LOCATIONS), ("qualities", "1,2,3,4,5")])
++                    .send()
++                    .await?;
++
++                if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
++                    eprintln!("\n⚠️ 挂单物价触发 429，跳过剩余批次。");
++                    break;
++                }
++                let records = resp.error_for_status()?.json::<Vec<AodpPrice>>().await?;
++                for r in records {
++                    if r.sell_price_min > 0 {
++                        let ts = r.sell_price_min_date.as_deref().and_then(parse_iso_to_unix);
++                        live_grouped
++                            .entry((r.item_id, r.quality))
++                            .or_default()
++                            .push((r.sell_price_min, ts));
++                    }
++                }
++            }
++            eprintln!();
++
++            for (key, entries) in live_grouped {
++                let Some(buy_price) = pick_royal_buy_price(&entries, now) else {
++                    continue;
++                };
++                live_prices.insert(key.clone(), buy_price);
++
++                let k_str = price_key(&key.0, key.1);
++                let is_manual = db
++                    .prices
++                    .get(&k_str)
++                    .map(|r| r.source == "manual")
++                    .unwrap_or(false);
++                if !is_manual {
++                    db.prices.insert(
++                        k_str,
++                        PriceRecord {
++                            price: buy_price,
++                            source: "live".to_string(),
++                            updated_at: now,
++                            tag: Some("[挂]".to_string()),
++                        },
++                    );
++                    updated_count += 1;
++                }
++            }
+         }
+     }
+ 
+     Ok((updated_count, trade_added))
+ }
+diff --git a/src/pricing.rs b/src/pricing.rs
+index 0000001..0000002 100644
+--- a/src/pricing.rs
++++ b/src/pricing.rs
+@@ -17,37 +17,45 @@ pub fn lookup_exact_or_lower_quality(
+             return Some((rec.price, "[手]".to_string(), false));
+         }
+     }
+-    // 1. 若本次主动更新了实时/近期价，优先使用新鲜价
+-    if let Some(&p) = live_prices.get(&(item_id.to_string(), q)) {
+-        return Some((p, String::new(), false));
+-    }
++    // 1. 优先使用真实成交均价 / 刚刚成交价（不被虚高挂单拉偏）
+     if let Some(&p) = recent_trades.get(&(item_id.to_string(), q)) {
+-        return Some((p, "[近]".to_string(), true));
++        let tag = db
++            .prices
++            .get(&price_key(item_id, q))
++            .and_then(|r| r.tag.clone())
++            .unwrap_or_else(|| "[均]".to_string());
++        return Some((p, tag, false));
+     }
+     // 2. 使用该场战斗自己冻结的价格快照（防止未来物价波动改写历史）
+     if let Some(snap) = battle_snapshot {
+         if let Some(rec) = snap.get(&price_key(item_id, q)) {
+             if rec.price > 0 {
+                 let tag = rec.tag.clone().unwrap_or_else(|| "[快照]".to_string());
+-                let is_approx = rec.source != "live" && rec.source != "manual";
++                let is_approx = !matches!(
++                    rec.source.as_str(),
++                    "manual" | "recent_trade" | "avg_trade"
++                );
+                 return Some((rec.price, tag, is_approx));
+             }
+         }
+     }
++    // 2.5 若无历史成交，才用本次挂单卖价兜底
++    if let Some(&p) = live_prices.get(&(item_id.to_string(), q)) {
++        return Some((p, "[挂]".to_string(), true));
++    }
+     // 3. 回退全局本地库
+     if let Some(rec) = db.prices.get(&price_key(item_id, q)) {
+         if rec.price > 0 {
+-            let tag = if rec.source == "recent_trade" {
+-                "[近库]"
+-            } else {
+-                "[库]"
+-            };
+-            return Some((rec.price, tag.to_string(), true));
++            let tag = rec.tag.clone().unwrap_or_else(|| "[库]".to_string());
++            let is_approx = !matches!(
++                rec.source.as_str(),
++                "manual" | "recent_trade" | "avg_trade"
++            );
++            return Some((rec.price, tag, is_approx));
+         }
+     }
+ 
+     // 4. 同装备向下查普通品质
+     let max_fallback_q = if allow_higher_if_worn { q } else { q.min(3) };
+     let mut lower_cands = Vec::new();
+     for cand in [q.saturating_sub(1), 3, 2, 1] {
+@@ -55,10 +63,7 @@ pub fn lookup_exact_or_lower_quality(
+             lower_cands.push(cand);
+         }
+     }
+     for fq in lower_cands {
+-        if let Some(&p) = live_prices.get(&(item_id.to_string(), fq)) {
+-            return Some((p, format!("≈Q{fq}"), true));
+-        }
+         if let Some(&p) = recent_trades.get(&(item_id.to_string(), fq)) {
+             return Some((p, format!("≈Q{fq}"), true));
+         }
+@@ -68,6 +73,9 @@ pub fn lookup_exact_or_lower_quality(
+                 return Some((rec.price, format!("≈Q{fq}"), true));
+             }
+         }
++        if let Some(&p) = live_prices.get(&(item_id.to_string(), fq)) {
++            return Some((p, format!("≈Q{fq}"), true));
++        }
+         if let Some(rec) = db.prices.get(&price_key(item_id, fq)) {
+             if rec.price > 0 {
+                 return Some((rec.price, format!("≈Q{fq}"), true));
+@@ -98,12 +106,12 @@ fn lookup_sibling_price(
+     }
+ 
+     for q in q_order {
+-        if let Some(&p) = live_prices.get(&(sib_id.to_string(), q)) {
+-            return Some(p);
+-        }
+         if let Some(&p) = recent_trades.get(&(sib_id.to_string(), q)) {
+             return Some(p);
+         }
++        if let Some(&p) = live_prices.get(&(sib_id.to_string(), q)) {
++            return Some(p);
++        }
+         if let Some(rec) = db.prices.get(&price_key(sib_id, q)) {
+             if rec.price > 0 {
+                 return Some(rec.price);
+@@ -161,12 +169,12 @@ pub fn lookup_price(
+         if fq == q {
+             continue;
+         }
+-        if let Some(&p) = live_prices.get(&(item_id.to_string(), fq)) {
+-            return (p, format!("≈Q{fq}"), false, true, false);
+-        }
+         if let Some(&p) = recent_trades.get(&(item_id.to_string(), fq)) {
+             return (p, format!("≈Q{fq}"), false, true, false);
+         }
++        if let Some(&p) = live_prices.get(&(item_id.to_string(), fq)) {
++            return (p, format!("≈Q{fq}"), false, true, false);
++        }
+         if let Some(rec) = db.prices.get(&price_key(item_id, fq)) {
+             if rec.price > 0 {
+                 return (rec.price, format!("≈Q{fq}"), false, true, false);
+@@ -349,7 +357,7 @@ pub fn build_battle_snapshot(
+                                         source: if approx {
+                                             "approx".to_string()
+                                         } else {
+-                                            "live".to_string()
++                                            "avg_trade".to_string()
+                                         },
+                                         updated_at: now,
+                                         tag: if tag.is_empty() {
+@@ -379,7 +387,7 @@ pub fn build_battle_snapshot(
+                                         source: if approx {
+                                             "approx".to_string()
+                                         } else {
+-                                            "live".to_string()
++                                            "avg_trade".to_string()
+                                         },
+                                         updated_at: now,
+                                         tag: if tag.is_empty() {
+diff --git a/src/render.rs b/src/render.rs
+index 0000001..0000002 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -8,8 +8,9 @@ use crate::filter::{
+     non_empty, DEFAULT_GUILD_NAME,
+ };
+ use crate::models::{
+-    AllianceLossAgg, BattleSummary, DeathRecord, Equipment, EvaluatedEvent, GearCost, GuildLossAgg,
+-    GuildMemberStats, KillEvent, LocalDb, PriceRecord, StoredBattle,
++    AllianceHealAgg, AllianceLossAgg, BattleSummary, CombatantStats, DeathRecord, Equipment,
++    EvaluatedEvent, GearCost, GuildLossAgg, GuildMemberStats, KillEvent, LocalDb, PriceRecord,
++    Relation, StoredBattle,
+ };
+ use crate::pricing::{
+     build_battle_snapshot, evaluate_equipment, evaluate_inventory, lookup_exact_or_lower_quality,
+@@ -17,7 +18,7 @@ use crate::pricing::{
+ use crate::theme::{
+     apply_relation_color, cell_r, fmt_num, format_cost_cell, format_cost_text, format_player_tag,
+     hdr, item_cell, killboard_url, new_clean_table, osc8_link, relation_cell, short_hms,
+-    short_time,
++    short_time, player_link,
+ };
+ use comfy_table::{Attribute, Cell, Color};
+ use std::collections::{HashMap, HashSet};
+@@ -323,6 +324,132 @@ fn render_battle_report(
+     let mut guild_losses: HashMap<(String, String), GuildLossAgg> = HashMap::new();
+     let mut evaluated_events = Vec::with_capacity(merged_events.len());
+ 
++    // 汇总全员参战人员（包括没死的胜利者，以及治疗榜数据）
++    let mut combatants: HashMap<String, CombatantStats> = HashMap::new();
++
++    let upsert_combatant = |map: &mut HashMap<String, CombatantStats>,
++                            pid: Option<&str>,
++                            name: &str,
++                            gid: Option<&str>,
++                            gname: Option<&str>,
++                            aid: Option<&str>,
++                            aname: Option<&str>,
++                            eq: Option<&Equipment>,
++                            ip: Option<f64>,
++                            ev_id: Option<u64>,
++                            db: &LocalDb| {
++        let entry = map.entry(name.to_string()).or_insert_with(|| CombatantStats {
++            player_id: pid.map(str::to_string),
++            name: name.to_string(),
++            guild_id: gid.map(str::to_string),
++            guild_name: gname.map(str::to_string),
++            alliance_id: aid.map(str::to_string),
++            alliance_name: aname.map(str::to_string),
++            relation: Relation::Hostile,
++            alliance_key: String::new(),
++            alliance_display: String::new(),
++            kills: 0,
++            assists: 0,
++            deaths: 0,
++            heal_events: 0,
++            total_damage: 0.0,
++            total_healing: 0.0,
++            max_single_healing: 0.0,
++            main_hand: None,
++            avg_ip: None,
++            sample_event_id: ev_id,
++        });
++        if entry.player_id.is_none() {
++            entry.player_id = non_empty(pid).map(str::to_string);
++        }
++        if entry.guild_id.is_none() {
++            entry.guild_id = non_empty(gid).map(str::to_string);
++        }
++        if entry.guild_name.is_none() {
++            entry.guild_name = non_empty(gname).map(str::to_string);
++        }
++        if entry.alliance_id.is_none() {
++            entry.alliance_id = non_empty(aid).map(str::to_string);
++        }
++        if entry.alliance_name.is_none() {
++            entry.alliance_name = non_empty(aname).map(str::to_string);
++        }
++        if entry.main_hand.is_none() {
++            if let Some(mh) = eq
++                .and_then(|e| e.main_hand.as_ref())
++                .and_then(|i| i.item_type.as_ref())
++            {
++                entry.main_hand = Some(mh.clone());
++            }
++        }
++        if entry.avg_ip.is_none() {
++            if let Some(v) = ip.filter(|&x| x > 0.0) {
++                entry.avg_ip = Some(v);
++            }
++        }
++        if entry.sample_event_id.is_none() {
++            entry.sample_event_id = ev_id;
++        }
++        let rel = classify_relation(
++            entry.guild_id.as_deref(),
++            entry.guild_name.as_deref(),
++            entry.alliance_id.as_deref(),
++            entry.alliance_name.as_deref(),
++            db,
++        );
++        let (ak, ad) = alliance_bucket(entry.alliance_name.as_deref(), rel);
++        entry.relation = rel;
++        entry.alliance_key = ak;
++        entry.alliance_display = ad;
++    };
++
++    for sb in stored_battles {
++        if let Some(players) = &sb.summary.players {
++            for (pid, bp) in players {
++                upsert_combatant(
++                    &mut combatants,
++                    Some(pid.as_str()),
++                    &bp.name,
++                    bp.guild_id.as_deref(),
++                    bp.guild_name.as_deref(),
++                    bp.alliance_id.as_deref(),
++                    bp.alliance_name.as_deref(),
++                    None,
++                    None,
++                    None,
++                    db,
++                );
++                if let Some(c) = combatants.get_mut(&bp.name) {
++                    c.kills += bp.kills.unwrap_or(0);
++                    c.deaths += bp.deaths.unwrap_or(0);
++                }
++            }
++        }
++    }
++
++    // 辅助映射：从事件里补充杀手与治疗者的 PlayerId
++    let mut combatant_ev_kills: HashMap<String, u32> = HashMap::new();
++    let mut combatant_ev_deaths: HashMap<String, u32> = HashMap::new();
++
+     for (idx, (ev, snap_opt)) in merged_events.iter().zip(event_snapshots.iter()).enumerate() {
+         let gear_eval = evaluate_equipment(
+             ev.victim.equipment.as_ref(),
+@@ -347,6 +474,97 @@ fn render_battle_report(
+         grand_total_approx |= gear_eval.total_approx;
+         grand_inv_approx |= inv_eval.inv_approx;
+ 
++        // 写入战斗参与者统计（杀手 / 死者 / 助攻治疗 / 同队）
++        upsert_combatant(
++            &mut combatants,
++            ev.killer.id.as_deref(),
++            &ev.killer.name,
++            ev.killer.guild_id.as_deref(),
++            ev.killer.guild_name.as_deref(),
++            ev.killer.alliance_id.as_deref(),
++            ev.killer.alliance_name.as_deref(),
++            ev.killer.equipment.as_ref(),
++            ev.killer.average_item_power,
++            Some(ev.event_id),
++            db,
++        );
++        *combatant_ev_kills.entry(ev.killer.name.clone()).or_default() += 1;
++
++        upsert_combatant(
++            &mut combatants,
++            ev.victim.id.as_deref(),
++            &ev.victim.name,
++            ev.victim.guild_id.as_deref(),
++            ev.victim.guild_name.as_deref(),
++            ev.victim.alliance_id.as_deref(),
++            ev.victim.alliance_name.as_deref(),
++            ev.victim.equipment.as_ref(),
++            ev.victim.average_item_power,
++            Some(ev.event_id),
++            db,
++        );
++        *combatant_ev_deaths.entry(ev.victim.name.clone()).or_default() += 1;
++
++        if let Some(parts) = &ev.participants {
++            for p in parts {
++                upsert_combatant(
++                    &mut combatants,
++                    p.id.as_deref(),
++                    &p.name,
++                    p.guild_id.as_deref(),
++                    p.guild_name.as_deref(),
++                    p.alliance_id.as_deref(),
++                    p.alliance_name.as_deref(),
++                    p.equipment.as_ref(),
++                    p.average_item_power,
++                    Some(ev.event_id),
++                    db,
++                );
++                if let Some(c) = combatants.get_mut(&p.name) {
++                    if p.name != ev.killer.name {
++                        c.assists += 1;
++                    }
++                    let dmg = p.damage_done.unwrap_or(0.0);
++                    let heal = p.support_healing_done.unwrap_or(0.0);
++                    c.total_damage += dmg;
++                    c.total_healing += heal;
++                    if heal > 0.0 {
++                        c.heal_events += 1;
++                        if heal > c.max_single_healing {
++                            c.max_single_healing = heal;
++                        }
++                    }
++                }
++            }
++        }
++        if let Some(members) = &ev.group_members {
++            for gm in members {
++                upsert_combatant(
++                    &mut combatants,
++                    gm.id.as_deref(),
++                    &gm.name,
++                    gm.guild_id.as_deref(),
++                    gm.guild_name.as_deref(),
++                    gm.alliance_id.as_deref(),
++                    gm.alliance_name.as_deref(),
++                    gm.equipment.as_ref(),
++                    gm.average_item_power,
++                    Some(ev.event_id),
++                    db,
++                );
++            }
++        }
++
+         let rel = classify_relation(
+             ev.victim.guild_id.as_deref(),
+             ev.victim.guild_name.as_deref(),
+@@ -364,6 +582,7 @@ fn render_battle_report(
+                 alliance_display: a_disp.clone(),
+                 relation: rel,
+                 guilds: HashSet::new(),
++                participants: HashSet::new(),
+                 deaths: 0,
+                 cross_cost: 0,
+                 full_cost: 0,
+@@ -392,6 +611,7 @@ fn render_battle_report(
+                 alliance_display: a_disp.clone(),
+                 guild_name: g_label.clone(),
+                 relation: rel,
++                participants: HashSet::new(),
+                 deaths: 0,
+                 cross_cost: 0,
+                 full_cost: 0,
+@@ -424,6 +644,44 @@ fn render_battle_report(
+         });
+     }
+ 
++    // 同步全员 K/D 并将每个参战人员计入联盟/公会参战池（让全员 0 死亡的胜利联盟也能上统计表）
++    for (name, c) in &mut combatants {
++        if let Some(&k) = combatant_ev_kills.get(name) {
++            if k > c.kills {
++                c.kills = k;
++            }
++        }
++        if let Some(&d) = combatant_ev_deaths.get(name) {
++            if d > c.deaths {
++                c.deaths = d;
++            }
++        }
++        let g_label = non_empty(c.guild_name.as_deref())
++            .unwrap_or("[无公会]")
++            .to_string();
++        let a_agg = alliance_losses
++            .entry(c.alliance_key.clone())
++            .or_insert_with(|| AllianceLossAgg {
++                alliance_display: c.alliance_display.clone(),
++                relation: c.relation,
++                guilds: HashSet::new(),
++                participants: HashSet::new(),
++                deaths: 0,
++                cross_cost: 0,
++                full_cost: 0,
++                inv_cost: 0,
++                cross_missing: 0,
++                total_missing: 0,
++                inv_missing: 0,
++                cross_approx: false,
++                total_approx: false,
++                inv_approx: false,
++            });
++        a_agg.guilds.insert(g_label.clone());
++        a_agg.participants.insert(c.name.clone());
++
++        if let Some(g_agg) = guild_losses.get_mut(&(c.alliance_key.clone(), g_label)) {
++            g_agg.participants.insert(c.name.clone());
++        }
++    }
++
+     let alliance_rank_val: HashMap<String, u64> = alliance_losses
+         .iter()
+         .map(|(k, v)| (k.clone(), v.full_cost + v.inv_cost))
+@@ -442,8 +700,11 @@ fn render_battle_report(
+             })
+     });
+ 
++    let alive_winners_count = combatants.values().filter(|c| c.deaths == 0).count();
++
+     println!(
+-        "\n{heading}（共 {} 次死亡）   整场十字架: {}   整场全套: {}   整场包内: {}",
++        "\n{heading}（参战 {} 人 | 死亡 {} 次 | 0死存活 {} 人）   整场十字架: {}   整场全套: {}   整场包内: {}",
++        combatants.len(),
+         merged_events.len(),
++        alive_winners_count,
+         format_cost_text(grand_cross_cost, grand_cross_missing, grand_cross_approx),
+         format_cost_text(grand_full_cost, grand_total_missing, grand_total_approx),
+         format_cost_text(grand_inv_cost, grand_inv_missing, grand_inv_approx)
+@@ -453,11 +714,11 @@ fn render_battle_report(
+         println!();
+         let mut deaths_table = new_clean_table();
+         deaths_table.set_header(vec![
+             hdr("#", true),
+             hdr("时间", false),
+             hdr("阵营", false),
+             hdr("联盟", false),
+-            hdr("死者 (可点)", false),
+-            hdr("击杀者", false),
++            hdr("参战 / 死者 (可点)", false),
++            hdr("击杀者 / 战绩 (可点)", false),
+             hdr("十字架", true),
+             hdr("全套总价", true),
+             hdr("包内价值", true),
+@@ -469,7 +730,11 @@ fn render_battle_report(
+         for (row_idx, item) in evaluated_events.iter().enumerate() {
+             let ev = &merged_events[item.idx_original];
+             let killer_tag = format_player_tag(&ev.killer.name, ev.killer.guild_name.as_deref());
++            let killer_linked =
++                player_link(ev.killer.id.as_deref(), Some(ev.event_id), &killer_tag);
+             let victim_raw = format_player_tag(&ev.victim.name, ev.victim.guild_name.as_deref());
+-            let victim_linked = osc8_link(&killboard_url(ev.event_id), &victim_raw);
++            let victim_linked = player_link(
++                ev.victim.id.as_deref(),
++                Some(ev.event_id),
++                &victim_raw,
++            );
++            let _ev_url = killboard_url(ev.event_id);
+ 
+             let mh_cell = match ev
+                 .victim
+@@ -484,19 +749,25 @@ fn render_battle_report(
+             };
+ 
+             let mut assist_count = 0usize;
+-            let mut top_healer: Option<(&str, f64)> = None;
++            let mut top_healer: Option<(&str, Option<&str>, f64)> = None;
+             if let Some(parts) = &ev.participants {
+                 for p in parts {
+                     if p.name != ev.killer.name {
+                         assist_count += 1;
+                     }
+                     let heal = p.support_healing_done.unwrap_or(0.0);
+-                    if heal > 0.0 && top_healer.map_or(true, |(_, max_h)| heal > max_h) {
+-                        top_healer = Some((p.name.as_str(), heal));
++                    if heal > 0.0 && top_healer.map_or(true, |(_, _, max_h)| heal > max_h) {
++                        let pid_fallback = p
++                            .id
++                            .as_deref()
++                            .or_else(|| combatants.get(&p.name).and_then(|c| c.player_id.as_deref()));
++                        top_healer = Some((p.name.as_str(), pid_fallback, heal));
+                     }
+                 }
+             }
+ 
+             let heal_cell = match top_healer {
+-                Some((name, val)) => {
+-                    Cell::new(format!("{name} ({})", fmt_num(val.round() as u64))).fg(Color::Green)
++                Some((name, pid, val)) => {
++                    let txt = format!("{name} ({})", fmt_num(val.round() as u64));
++                    Cell::new(player_link(pid, Some(ev.event_id), &txt)).fg(Color::Green)
+                 }
+                 None => Cell::new("-").fg(Color::DarkGrey),
+             };
+@@ -507,7 +778,7 @@ fn render_battle_report(
+                 relation_cell(item.relation),
+                 apply_relation_color(Cell::new(&item.alliance_display), item.relation),
+                 apply_relation_color(Cell::new(victim_linked), item.relation),
+-                Cell::new(killer_tag),
++                Cell::new(killer_linked),
+                 format_cost_cell(
+                     item.gear_eval.cross_cost,
+                     item.gear_eval.cross_missing,
+@@ -526,6 +797,56 @@ fn render_battle_report(
+                 heal_cell,
+             ]);
+         }
++
++        // 把所有 0 死亡的胜利者放在列表最后（死亡次数 = 0）
++        let mut alive_winners: Vec<&CombatantStats> =
++            combatants.values().filter(|c| c.deaths == 0).collect();
++        alive_winners.sort_by(|a, b| {
++            a.alliance_key
++                .cmp(&b.alliance_key)
++                .then_with(|| a.guild_name.cmp(&b.guild_name))
++                .then_with(|| (b.kills + b.assists).cmp(&(a.kills + a.assists)))
++                .then_with(|| b.total_healing.total_cmp(&a.total_healing))
++                .then_with(|| a.name.cmp(&b.name))
++        });
++
++        let base_idx = evaluated_events.len();
++        for (offset_idx, c) in alive_winners.iter().enumerate() {
++            let p_raw = format_player_tag(&c.name, c.guild_name.as_deref());
++            let p_linked = player_link(c.player_id.as_deref(), c.sample_event_id, &p_raw);
++            let mh_cell = match c.main_hand.as_deref() {
++                Some(mh) => item_cell(mh, &db.item_names_zh),
++                None => Cell::new("-"),
++            };
++            let record_str = format!(
++                "杀{} 助{} 伤{}",
++                c.kills,
++                c.assists,
++                fmt_num(c.total_damage.round() as u64)
++            );
++            let heal_val = c.total_healing.round() as u64;
++            let heal_cell = if heal_val > 0 {
++                cell_r(fmt_num(heal_val)).fg(Color::Green)
++            } else {
++                Cell::new("-").fg(Color::DarkGrey)
++            };
++
++            deaths_table.add_row(vec![
++                cell_r((base_idx + offset_idx + 1).to_string()),
++                Cell::new("0死(存活)").fg(Color::Green),
++                relation_cell(c.relation),
++                apply_relation_color(Cell::new(&c.alliance_display), c.relation),
++                apply_relation_color(Cell::new(p_linked), c.relation),
++                Cell::new(record_str).fg(Color::DarkGrey),
++                cell_r("0"),
++                cell_r("0"),
++                cell_r("0"),
++                mh_cell,
++                cell_r(c.assists.to_string()),
++                heal_cell,
++            ]);
++        }
++
+         println!("{deaths_table}");
+     }
+ 
+@@ -543,7 +864,8 @@ fn render_battle_report(
+         hdr("阵营", false),
+         hdr("联盟", false),
+         hdr("公会数", true),
+-        hdr("死亡人数", true),
++        hdr("参战", true),
++        hdr("死亡", true),
+         hdr("十字架总价", true),
+         hdr("全套总价", true),
+         hdr("包内总价", true),
+@@ -555,6 +877,7 @@ fn render_battle_report(
+             relation_cell(a.relation),
+             apply_relation_color(Cell::new(&a.alliance_display), a.relation),
+             cell_r(a.guilds.len().to_string()),
++            cell_r(a.participants.len().to_string()),
+             cell_r(a.deaths.to_string()),
+             format_cost_cell(a.cross_cost, a.cross_missing, a.cross_approx),
+             format_cost_cell(a.full_cost, a.total_missing, a.total_approx),
+@@ -587,7 +910,8 @@ fn render_battle_report(
+         hdr("阵营", false),
+         hdr("联盟", false),
+         hdr("公会", false),
+-        hdr("死亡人数", true),
++        hdr("参战", true),
++        hdr("死亡", true),
+         hdr("十字架总价", true),
+         hdr("全套总价", true),
+         hdr("包内总价", true),
+@@ -599,6 +923,7 @@ fn render_battle_report(
+             relation_cell(g.relation),
+             apply_relation_color(Cell::new(&g.alliance_display), g.relation),
+             apply_relation_color(Cell::new(&g.guild_name), g.relation),
++            cell_r(g.participants.len().to_string()),
+             cell_r(g.deaths.to_string()),
+             format_cost_cell(g.cross_cost, g.cross_missing, g.cross_approx),
+             format_cost_cell(g.full_cost, g.total_missing, g.total_approx),
+@@ -612,6 +937,132 @@ fn render_battle_report(
+     }
+     println!("{gl_table}");
+ 
++    // 全场治疗排行榜 & 各联盟治疗实力综合对比（没有对比就没有伤害！）
++    let mut healers: Vec<&CombatantStats> = combatants
++        .values()
++        .filter(|c| c.total_healing > 0.0)
++        .collect();
++    healers.sort_by(|a, b| {
++        b.total_healing
++            .total_cmp(&a.total_healing)
++            .then_with(|| b.max_single_healing.total_cmp(&a.max_single_healing))
++    });
++
++    if !healers.is_empty() {
++        let mut alliance_heals: HashMap<String, AllianceHealAgg> = HashMap::new();
++        for h in &healers {
++            let entry = alliance_heals
++                .entry(h.alliance_key.clone())
++                .or_insert_with(|| AllianceHealAgg {
++                    alliance_display: h.alliance_display.clone(),
++                    relation: h.relation,
++                    healer_count: 0,
++                    healer_deaths: 0,
++                    total_healing: 0.0,
++                    top_healer_name: h.name.clone(),
++                    top_healer_val: h.total_healing,
++                });
++            entry.healer_count += 1;
++            if h.deaths > 0 {
++                entry.healer_deaths += 1;
++            }
++            entry.total_healing += h.total_healing;
++            if h.total_healing > entry.top_healer_val {
++                entry.top_healer_val = h.total_healing;
++                entry.top_healer_name = h.name.clone();
++            }
++        }
++
++        let mut ah_list: Vec<AllianceHealAgg> = alliance_heals.into_values().collect();
++        ah_list.sort_by(|a, b| b.total_healing.total_cmp(&a.total_healing));
++
++        println!("\n各联盟治疗实力综合对比（共 {} 组有治疗产出）\n", ah_list.len());
++        let mut ah_table = new_clean_table();
++        ah_table.set_header(vec![
++            hdr("排名", true),
++            hdr("阵营", false),
++            hdr("联盟", false),
++            hdr("奶妈数", true),
++            hdr("奶妈阵亡", true),
++            hdr("联盟总治疗", true),
++            hdr("人均治疗", true),
++            hdr("最强奶妈 (总治疗)", false),
++        ]);
++        for (idx, ah) in ah_list.iter().enumerate() {
++            let avg = if ah.healer_count > 0 {
++                (ah.total_healing / ah.healer_count as f64).round() as u64
++            } else {
++                0
++            };
++            ah_table.add_row(vec![
++                cell_r((idx + 1).to_string()),
++                relation_cell(ah.relation),
++                apply_relation_color(Cell::new(&ah.alliance_display), ah.relation),
++                cell_r(ah.healer_count.to_string()),
++                if ah.healer_deaths > 0 {
++                    cell_r(ah.healer_deaths.to_string()).fg(Color::Red)
++                } else {
++                    cell_r("0")
++                },
++                cell_r(fmt_num(ah.total_healing.round() as u64)).fg(Color::Green),
++                cell_r(fmt_num(avg)),
++                Cell::new(format!(
++                    "{} ({})",
++                    ah.top_healer_name,
++                    fmt_num(ah.top_healer_val.round() as u64)
++                )),
++            ]);
++        }
++        println!("{ah_table}");
++
++        let show_limit = if show_all_details { healers.len() } else { 25.min(healers.len()) };
++        println!(
++            "\n全场治疗排行榜（前 {} / 共 {} 位奶妈，名字可点看配装）\n",
++            show_limit,
++            healers.len()
++        );
++        let mut h_table = new_clean_table();
++        h_table.set_header(vec![
++            hdr("排名", true),
++            hdr("阵营", false),
++            hdr("联盟", false),
++            hdr("治疗者 (可点)", false),
++            hdr("治疗武器", false),
++            hdr("IP", true),
++            hdr("死亡", true),
++            hdr("有效参与", true),
++            hdr("累计治疗量", true),
++            hdr("单次最高", true),
++        ]);
++        for (idx, h) in healers.iter().take(show_limit).enumerate() {
++            let p_raw = format_player_tag(&h.name, h.guild_name.as_deref());
++            let p_linked = player_link(h.player_id.as_deref(), h.sample_event_id, &p_raw);
++            let mh_cell = match h.main_hand.as_deref() {
++                Some(mh) => item_cell(mh, &db.item_names_zh),
++                None => Cell::new("-"),
++            };
++            let ip = h
++                .avg_ip
++                .map(|v| format!("{v:.0}"))
++                .unwrap_or_else(|| "-".to_string());
++            h_table.add_row(vec![
++                cell_r((idx + 1).to_string()),
++                relation_cell(h.relation),
++                apply_relation_color(Cell::new(&h.alliance_display), h.relation),
++                apply_relation_color(Cell::new(p_linked), h.relation),
++                mh_cell,
++                cell_r(ip),
++                if h.deaths > 0 { cell_r(h.deaths.to_string()).fg(Color::Red) } else { cell_r("0") },
++                cell_r(h.heal_events.to_string()),
++                cell_r(fmt_num(h.total_healing.round() as u64)).fg(Color::Green),
++                cell_r(fmt_num(h.max_single_healing.round() as u64)),
++            ]);
++        }
++        println!("{h_table}");
++    }
++
+     // 我方公会参战名单
+     let mut guild_roster: HashMap<String, GuildMemberStats> = HashMap::new();
+     for sb in stored_battles {
+@@ -668,7 +1119,12 @@ fn render_battle_report(
+                 }
+             }
+         }
++        for (pname, stat) in &mut guild_roster {
++            if stat.player_id.is_none() {
++                stat.player_id = combatants.get(pname).and_then(|c| c.player_id.clone());
++            }
++        }
+     }
+ 
+     let our_cross_sum: u64 = guild_roster.values().map(|p| p.cross_total).sum();
+@@ -743,10 +1199,11 @@ fn render_battle_report(
+                 cell_r("0")
+             };
+ 
+-            let player_cell = if let Some(first_death) = p.death_records.first() {
+-                Cell::new(osc8_link(&killboard_url(first_death.event_id), &p.name))
+-                    .add_attribute(Attribute::Bold)
+-            } else {
+-                Cell::new(&p.name).add_attribute(Attribute::Bold)
+-            };
++            let linked_name = player_link(
++                p.player_id.as_deref(),
++                p.death_records.first().map(|d| d.event_id),
++                &p.name,
++            );
++            let player_cell = Cell::new(linked_name).add_attribute(Attribute::Bold);
+ 
+             let mut row = vec![cell_r((idx + 1).to_string()), player_cell];
