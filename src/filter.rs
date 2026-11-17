@@ -72,7 +72,8 @@ pub fn equivalent_tier_siblings(item_id: &str) -> (u8, Vec<String>) {
     let mut siblings = Vec::new();
     for t in 4u8..=8 {
         if let Some(e) = equiv.checked_sub(t) {
-            if e <= 4 && !(t == tier && e == enchant) {
+            let max_e = if enchant >= 4 { 4 } else { 3 };
+            if e <= max_e && !(t == tier && e == enchant) {
                 let id = if e == 0 {
                     format!("T{t}_{suffix}")
                 } else {

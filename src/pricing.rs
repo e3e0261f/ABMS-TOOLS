@@ -14,42 +14,44 @@ pub fn lookup_exact_or_lower_quality(
     q: u8,
     allow_higher_if_worn: bool,
 ) -> Option<(u64, String, bool)> {
-    // 0. 手动锁定价优先
     if let Some(rec) = db.prices.get(&price_key(item_id, q)) {
         if rec.source == "manual" && rec.price > 0 {
             return Some((rec.price, "[手]".to_string(), false));
         }
     }
-    // 1. 若本次主动更新了实时/近期价，优先使用新鲜价
-    if let Some(&p) = live_prices.get(&(item_id.to_string(), q)) {
-        return Some((p, String::new(), false));
-    }
+    // 1. 优先使用真实成交均价 / 刚刚成交价
     if let Some(&p) = recent_trades.get(&(item_id.to_string(), q)) {
-        return Some((p, "[近]".to_string(), true));
+        let tag = db
+            .prices
+            .get(&price_key(item_id, q))
+            .and_then(|r| r.tag.clone())
+            .unwrap_or_else(|| "[均]".to_string());
+        return Some((p, tag, false));
     }
-    // 2. 使用该场战斗自己冻结的价格快照（防止未来物价波动改写历史）
+    // 2. 该场战斗冻结快照
     if let Some(snap) = battle_snapshot {
         if let Some(rec) = snap.get(&price_key(item_id, q)) {
             if rec.price > 0 {
                 let tag = rec.tag.clone().unwrap_or_else(|| "[快照]".to_string());
-                let is_approx = rec.source != "live" && rec.source != "manual";
+                let is_approx =
+                    !matches!(rec.source.as_str(), "manual" | "recent_trade" | "avg_trade");
                 return Some((rec.price, tag, is_approx));
             }
         }
     }
-    // 3. 回退全局本地库
+    // 3. 无历史成交才用挂单价兜底
+    if let Some(&p) = live_prices.get(&(item_id.to_string(), q)) {
+        return Some((p, "[挂]".to_string(), true));
+    }
+    // 4. 全局本地库
     if let Some(rec) = db.prices.get(&price_key(item_id, q)) {
         if rec.price > 0 {
-            let tag = if rec.source == "recent_trade" {
-                "[近库]"
-            } else {
-                "[库]"
-            };
-            return Some((rec.price, tag.to_string(), true));
+            let tag = rec.tag.clone().unwrap_or_else(|| "[库]".to_string());
+            let is_approx = !matches!(rec.source.as_str(), "manual" | "recent_trade" | "avg_trade");
+            return Some((rec.price, tag, is_approx));
         }
     }
 
-    // 4. 同装备向下查普通品质
     let max_fallback_q = if allow_higher_if_worn { q } else { q.min(3) };
     let mut lower_cands = Vec::new();
     for cand in [q.saturating_sub(1), 3, 2, 1] {
@@ -58,9 +60,6 @@ pub fn lookup_exact_or_lower_quality(
         }
     }
     for fq in lower_cands {
-        if let Some(&p) = live_prices.get(&(item_id.to_string(), fq)) {
-            return Some((p, format!("≈Q{fq}"), true));
-        }
         if let Some(&p) = recent_trades.get(&(item_id.to_string(), fq)) {
             return Some((p, format!("≈Q{fq}"), true));
         }
@@ -70,6 +69,9 @@ pub fn lookup_exact_or_lower_quality(
                     return Some((rec.price, format!("≈Q{fq}"), true));
                 }
             }
+        }
+        if let Some(&p) = live_prices.get(&(item_id.to_string(), fq)) {
+            return Some((p, format!("≈Q{fq}"), true));
         }
         if let Some(rec) = db.prices.get(&price_key(item_id, fq)) {
             if rec.price > 0 {
@@ -102,10 +104,10 @@ fn lookup_sibling_price(
     }
 
     for q in q_order {
-        if let Some(&p) = live_prices.get(&(sib_id.to_string(), q)) {
+        if let Some(&p) = recent_trades.get(&(sib_id.to_string(), q)) {
             return Some(p);
         }
-        if let Some(&p) = recent_trades.get(&(sib_id.to_string(), q)) {
+        if let Some(&p) = live_prices.get(&(sib_id.to_string(), q)) {
             return Some(p);
         }
         if let Some(rec) = db.prices.get(&price_key(sib_id, q)) {
@@ -117,7 +119,6 @@ fn lookup_sibling_price(
     None
 }
 
-/// 返回: (单价, 来源标签, 是否无报价, 是否估算, 是否不可交易)
 pub fn lookup_price(
     live_prices: &HashMap<(String, u8), u64>,
     recent_trades: &HashMap<(String, u8), u64>,
@@ -167,10 +168,10 @@ pub fn lookup_price(
         if fq == q {
             continue;
         }
-        if let Some(&p) = live_prices.get(&(item_id.to_string(), fq)) {
+        if let Some(&p) = recent_trades.get(&(item_id.to_string(), fq)) {
             return (p, format!("≈Q{fq}"), false, true, false);
         }
-        if let Some(&p) = recent_trades.get(&(item_id.to_string(), fq)) {
+        if let Some(&p) = live_prices.get(&(item_id.to_string(), fq)) {
             return (p, format!("≈Q{fq}"), false, true, false);
         }
         if let Some(rec) = db.prices.get(&price_key(item_id, fq)) {
@@ -345,7 +346,6 @@ pub fn evaluate_inventory(
     }
 }
 
-/// 为单场战斗冻结一套完整价格快照（记录当时算出的每个物品单价及标签）
 pub fn build_battle_snapshot(
     events: &[KillEvent],
     live_prices: &HashMap<(String, u8), u64>,
@@ -373,7 +373,7 @@ pub fn build_battle_snapshot(
                                         source: if approx {
                                             "approx".to_string()
                                         } else {
-                                            "live".to_string()
+                                            "avg_trade".to_string()
                                         },
                                         updated_at: now,
                                         tag: if tag.is_empty() {
@@ -405,7 +405,7 @@ pub fn build_battle_snapshot(
                                     source: if approx {
                                         "approx".to_string()
                                     } else {
-                                        "live".to_string()
+                                        "avg_trade".to_string()
                                     },
                                     updated_at: now,
                                     tag: if tag.is_empty() {

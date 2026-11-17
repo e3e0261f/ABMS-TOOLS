@@ -404,24 +404,25 @@ pub async fn fetch_prices_and_recent_trades(
     }
 
     let now = now_unix();
-    let mut live_grouped: HashMap<(String, u8), Vec<(u64, Option<u64>)>> = HashMap::new();
     let mut rate_limited = false;
+    let mut trade_added = 0usize;
 
-    let chunks: Vec<&[String]> = unique_ids.chunks(60).collect();
-    let total_chunks = chunks.len();
-    for (ci, chunk) in chunks.into_iter().enumerate() {
-        eprint!(
-            "\r  [联网] 查询皇家城实时买价: 第 {}/{} 批",
-            ci + 1,
-            total_chunks
-        );
+    // 1. 优先查 /stats/history 真实成交均价（有 24h 内刚成交的用 [刚]，否则用近期成交量加权均价 [均]）
+    let h_chunks: Vec<&[String]> = unique_ids.chunks(40).collect();
+    let total_h = h_chunks.len();
+    for (hi, chunk) in h_chunks.into_iter().enumerate() {
+        eprint!("\r  [联网] 查询近期成交均价: 第 {}/{} 批", hi + 1, total_h);
         let _ = io::stderr().flush();
 
         let ids_param = chunk.join(",");
-        let url = format!("{AODP_PRICE_BASE}/{ids_param}.json");
+        let url = format!("{AODP_HISTORY_BASE}/{ids_param}.json");
         let resp = client
             .get(url)
-            .query(&[("locations", ROYAL_LOCATIONS), ("qualities", "1,2,3,4,5")])
+            .query(&[
+                ("locations", ROYAL_LOCATIONS),
+                ("qualities", "1,2,3,4,5"),
+                ("time-scale", "6"),
+            ])
             .send()
             .await?;
 
@@ -431,129 +432,150 @@ pub async fn fetch_prices_and_recent_trades(
                 .get("RateLimit-Reset")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("未知");
-            eprintln!("\n⚠️ 实时物价触发 429 (Reset: {reset})，自动改用本地数据库。");
+            eprintln!("\n⚠️ 成交历史接口触发 429 (Reset: {reset})，自动改用本地数据库。");
             rate_limited = true;
             break;
         }
+        if !resp.status().is_success() {
+            continue;
+        }
 
-        let records = resp.error_for_status()?.json::<Vec<AodpPrice>>().await?;
-        for r in records {
-            if r.sell_price_min > 0 {
-                let ts = r.sell_price_min_date.as_deref().and_then(parse_iso_to_unix);
-                live_grouped
-                    .entry((r.item_id, r.quality))
-                    .or_default()
-                    .push((r.sell_price_min, ts));
+        let Ok(hist_list) = resp.json::<Vec<AodpHistoryResp>>().await else {
+            continue;
+        };
+
+        let mut points_by_item: HashMap<(String, u8), Vec<(u64, u64, f64)>> = HashMap::new();
+        for h in hist_list {
+            for pt in h.data {
+                if pt.item_count > 0 && pt.avg_price > 0.0 {
+                    let ts = pt
+                        .timestamp
+                        .as_deref()
+                        .and_then(parse_iso_to_unix)
+                        .unwrap_or(0);
+                    points_by_item
+                        .entry((h.item_id.clone(), h.quality))
+                        .or_default()
+                        .push((ts, pt.item_count, pt.avg_price));
+                }
+            }
+        }
+
+        for (key, mut pts) in points_by_item {
+            pts.sort_by(|a, b| b.0.cmp(&a.0));
+            let newest_ts = pts[0].0;
+
+            let mut total_vol = 0u64;
+            let mut total_val = 0f64;
+            for &(_, count, avg_p) in &pts {
+                total_vol += count;
+                total_val += avg_p * (count as f64);
+            }
+            if total_vol == 0 {
+                continue;
+            }
+            let avg_all = (total_val / (total_vol as f64)).round() as u64;
+
+            let (chosen_price, source_name, tag_str) = if newest_ts >= now.saturating_sub(24 * 3600)
+            {
+                let fresh_start = newest_ts.saturating_sub(12 * 3600);
+                let mut f_vol = 0u64;
+                let mut f_val = 0f64;
+                for &(ts, count, avg_p) in &pts {
+                    if ts >= fresh_start {
+                        f_vol += count;
+                        f_val += avg_p * (count as f64);
+                    }
+                }
+                if f_vol > 0 {
+                    (
+                        (f_val / (f_vol as f64)).round() as u64,
+                        "recent_trade",
+                        "[刚]",
+                    )
+                } else {
+                    (avg_all, "avg_trade", "[均]")
+                }
+            } else {
+                (avg_all, "avg_trade", "[均]")
+            };
+
+            recent_trades.insert(key.clone(), chosen_price);
+
+            let k_str = price_key(&key.0, key.1);
+            let is_manual = db
+                .prices
+                .get(&k_str)
+                .map(|r| r.source == "manual")
+                .unwrap_or(false);
+            if !is_manual {
+                db.prices.insert(
+                    k_str,
+                    PriceRecord {
+                        price: chosen_price,
+                        source: source_name.to_string(),
+                        updated_at: now,
+                        tag: Some(tag_str.to_string()),
+                    },
+                );
+                trade_added += 1;
             }
         }
     }
-    if !rate_limited {
+    if !rate_limited && total_h > 0 {
         eprintln!();
     }
 
+    // 2. 仅对完全没有历史成交记录的装备，才兜底查挂单卖价 [挂]
     let mut updated_count = 0usize;
-    for (key, entries) in live_grouped {
-        let Some(buy_price) = pick_royal_buy_price(&entries, now) else {
-            continue;
-        };
-        live_prices.insert(key.clone(), buy_price);
-
-        let k_str = price_key(&key.0, key.1);
-        let is_manual = db
-            .prices
-            .get(&k_str)
-            .map(|r| r.source == "manual")
-            .unwrap_or(false);
-        if !is_manual {
-            db.prices.insert(
-                k_str,
-                PriceRecord {
-                    price: buy_price,
-                    source: "live".to_string(),
-                    updated_at: now,
-                    tag: None,
-                },
-            );
-            updated_count += 1;
-        }
-    }
-
-    let mut trade_added = 0usize;
     if !rate_limited {
-        let need_hist_ids: Vec<String> = unique_ids
+        let need_listing_ids: Vec<String> = unique_ids
             .into_iter()
-            .filter(|id| !(1u8..=3).any(|q| live_prices.contains_key(&(id.clone(), q))))
+            .filter(|id| !(1u8..=3).any(|q| recent_trades.contains_key(&(id.clone(), q))))
             .collect();
 
-        let h_chunks: Vec<&[String]> = need_hist_ids.chunks(40).collect();
-        let total_h = h_chunks.len();
-        for (hi, chunk) in h_chunks.into_iter().enumerate() {
-            eprint!(
-                "\r  [联网] 补充 48h 近期成交均价: 第 {}/{} 批",
-                hi + 1,
-                total_h
-            );
-            let _ = io::stderr().flush();
+        if !need_listing_ids.is_empty() {
+            let mut live_grouped: HashMap<(String, u8), Vec<(u64, Option<u64>)>> = HashMap::new();
+            let chunks: Vec<&[String]> = need_listing_ids.chunks(60).collect();
+            let total_chunks = chunks.len();
+            for (ci, chunk) in chunks.into_iter().enumerate() {
+                eprint!(
+                    "\r  [联网] 补充无成交记录装备挂单价: 第 {}/{} 批",
+                    ci + 1,
+                    total_chunks
+                );
+                let _ = io::stderr().flush();
 
-            let ids_param = chunk.join(",");
-            let url = format!("{AODP_HISTORY_BASE}/{ids_param}.json");
-            let resp = client
-                .get(url)
-                .query(&[
-                    ("locations", ROYAL_LOCATIONS),
-                    ("qualities", "1,2,3,4,5"),
-                    ("time-scale", "6"),
-                ])
-                .send()
-                .await?;
+                let ids_param = chunk.join(",");
+                let url = format!("{AODP_PRICE_BASE}/{ids_param}.json");
+                let resp = client
+                    .get(url)
+                    .query(&[("locations", ROYAL_LOCATIONS), ("qualities", "1,2,3,4,5")])
+                    .send()
+                    .await?;
 
-            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                eprintln!("\n⚠️ 历史成交接口触发 429，跳过剩余批次。");
-                break;
-            }
-            if !resp.status().is_success() {
-                continue;
-            }
-
-            let Ok(hist_list) = resp.json::<Vec<AodpHistoryResp>>().await else {
-                continue;
-            };
-
-            let mut points_by_item: HashMap<(String, u8), Vec<(u64, u64, f64)>> = HashMap::new();
-            for h in hist_list {
-                for pt in h.data {
-                    if pt.item_count > 0 && pt.avg_price > 0.0 {
-                        let ts = pt
-                            .timestamp
-                            .as_deref()
-                            .and_then(parse_iso_to_unix)
-                            .unwrap_or(0);
-                        points_by_item
-                            .entry((h.item_id.clone(), h.quality))
+                if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    eprintln!("\n⚠️ 挂单物价触发 429，跳过剩余批次。");
+                    break;
+                }
+                let records = resp.error_for_status()?.json::<Vec<AodpPrice>>().await?;
+                for r in records {
+                    if r.sell_price_min > 0 {
+                        let ts = r.sell_price_min_date.as_deref().and_then(parse_iso_to_unix);
+                        live_grouped
+                            .entry((r.item_id, r.quality))
                             .or_default()
-                            .push((ts, pt.item_count, pt.avg_price));
+                            .push((r.sell_price_min, ts));
                     }
                 }
             }
+            eprintln!();
 
-            for (key, mut pts) in points_by_item {
-                pts.sort_by(|a, b| b.0.cmp(&a.0));
-                let newest_ts = pts[0].0;
-                let window_start = newest_ts.saturating_sub(48 * 3600);
-
-                let mut total_vol = 0u64;
-                let mut total_val = 0f64;
-                for &(ts, count, avg_p) in pts.iter().take(16) {
-                    if ts >= window_start || total_vol == 0 {
-                        total_vol += count;
-                        total_val += avg_p * (count as f64);
-                    }
-                }
-                if total_vol == 0 {
+            for (key, entries) in live_grouped {
+                let Some(buy_price) = pick_royal_buy_price(&entries, now) else {
                     continue;
-                }
-                let weighted_price = (total_val / (total_vol as f64)).round() as u64;
-                recent_trades.insert(key.clone(), weighted_price);
+                };
+                live_prices.insert(key.clone(), buy_price);
 
                 let k_str = price_key(&key.0, key.1);
                 let is_manual = db
@@ -565,18 +587,15 @@ pub async fn fetch_prices_and_recent_trades(
                     db.prices.insert(
                         k_str,
                         PriceRecord {
-                            price: weighted_price,
-                            source: "recent_trade".to_string(),
+                            price: buy_price,
+                            source: "live".to_string(),
                             updated_at: now,
-                            tag: None,
+                            tag: Some("[挂]".to_string()),
                         },
                     );
-                    trade_added += 1;
+                    updated_count += 1;
                 }
             }
-        }
-        if total_h > 0 {
-            eprintln!();
         }
     }
 

@@ -50,6 +50,20 @@ pub fn killboard_url(event_id: u64) -> String {
     format!("https://albiononline.com/killboard/kill/{event_id}?server=live_sgp")
 }
 
+pub fn player_url(player_id: &str) -> String {
+    format!("https://albiononline.com/killboard/player/{player_id}?server=live_sgp")
+}
+
+pub fn player_link(player_id: Option<&str>, fallback_event_id: Option<u64>, label: &str) -> String {
+    if let Some(pid) = player_id.map(str::trim).filter(|s| !s.is_empty()) {
+        osc8_link(&player_url(pid), label)
+    } else if let Some(eid) = fallback_event_id {
+        osc8_link(&killboard_url(eid), label)
+    } else {
+        label.to_string()
+    }
+}
+
 pub fn osc8_link(url: &str, label: &str) -> String {
     format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\")
 }

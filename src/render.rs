@@ -8,16 +8,17 @@ use crate::filter::{
     non_empty, DEFAULT_GUILD_NAME,
 };
 use crate::models::{
-    AllianceLossAgg, BattleSummary, DeathRecord, Equipment, EvaluatedEvent, GearCost, GuildLossAgg,
-    GuildMemberStats, KillEvent, LocalDb, PriceRecord, StoredBattle,
+    AllianceHealAgg, AllianceLossAgg, BattleSummary, CombatantStats, DeathRecord, Equipment,
+    EvaluatedEvent, GearCost, GuildLossAgg, GuildMemberStats, KillEvent, LocalDb, PriceRecord,
+    Relation, StoredBattle,
 };
 use crate::pricing::{
     build_battle_snapshot, evaluate_equipment, evaluate_inventory, lookup_exact_or_lower_quality,
 };
 use crate::theme::{
     apply_relation_color, cell_r, fmt_num, format_cost_cell, format_cost_text, format_player_tag,
-    hdr, item_cell, killboard_url, new_clean_table, osc8_link, relation_cell, short_hms,
-    short_time,
+    hdr, item_cell, killboard_url, new_clean_table, osc8_link, player_link, relation_cell,
+    short_hms, short_time,
 };
 use comfy_table::{Attribute, Cell, Color};
 use std::collections::{HashMap, HashSet};
@@ -299,6 +300,112 @@ fn render_battle_report(
     let mut alliance_losses: HashMap<String, AllianceLossAgg> = HashMap::new();
     let mut guild_losses: HashMap<(String, String), GuildLossAgg> = HashMap::new();
     let mut evaluated_events = Vec::with_capacity(merged_events.len());
+    let mut combatants: HashMap<String, CombatantStats> = HashMap::new();
+
+    let upsert_combatant = |map: &mut HashMap<String, CombatantStats>,
+                            pid: Option<&str>,
+                            name: &str,
+                            gid: Option<&str>,
+                            gname: Option<&str>,
+                            aid: Option<&str>,
+                            aname: Option<&str>,
+                            eq: Option<&Equipment>,
+                            ip: Option<f64>,
+                            ev_id: Option<u64>,
+                            db: &LocalDb| {
+        let entry = map
+            .entry(name.to_string())
+            .or_insert_with(|| CombatantStats {
+                player_id: pid.map(str::to_string),
+                name: name.to_string(),
+                guild_id: gid.map(str::to_string),
+                guild_name: gname.map(str::to_string),
+                alliance_id: aid.map(str::to_string),
+                alliance_name: aname.map(str::to_string),
+                relation: Relation::Hostile,
+                alliance_key: String::new(),
+                alliance_display: String::new(),
+                kills: 0,
+                assists: 0,
+                deaths: 0,
+                heal_events: 0,
+                total_damage: 0.0,
+                total_healing: 0.0,
+                max_single_healing: 0.0,
+                main_hand: None,
+                avg_ip: None,
+                sample_event_id: ev_id,
+            });
+        if entry.player_id.is_none() {
+            entry.player_id = non_empty(pid).map(str::to_string);
+        }
+        if entry.guild_id.is_none() {
+            entry.guild_id = non_empty(gid).map(str::to_string);
+        }
+        if entry.guild_name.is_none() {
+            entry.guild_name = non_empty(gname).map(str::to_string);
+        }
+        if entry.alliance_id.is_none() {
+            entry.alliance_id = non_empty(aid).map(str::to_string);
+        }
+        if entry.alliance_name.is_none() {
+            entry.alliance_name = non_empty(aname).map(str::to_string);
+        }
+        if entry.main_hand.is_none() {
+            if let Some(mh) = eq
+                .and_then(|e| e.main_hand.as_ref())
+                .and_then(|i| i.item_type.as_ref())
+            {
+                entry.main_hand = Some(mh.clone());
+            }
+        }
+        if entry.avg_ip.is_none() {
+            if let Some(v) = ip.filter(|&x| x > 0.0) {
+                entry.avg_ip = Some(v);
+            }
+        }
+        if entry.sample_event_id.is_none() {
+            entry.sample_event_id = ev_id;
+        }
+        let rel = classify_relation(
+            entry.guild_id.as_deref(),
+            entry.guild_name.as_deref(),
+            entry.alliance_id.as_deref(),
+            entry.alliance_name.as_deref(),
+            db,
+        );
+        let (ak, ad) = alliance_bucket(entry.alliance_name.as_deref(), rel);
+        entry.relation = rel;
+        entry.alliance_key = ak;
+        entry.alliance_display = ad;
+    };
+
+    for sb in stored_battles {
+        if let Some(players) = &sb.summary.players {
+            for (pid, bp) in players {
+                upsert_combatant(
+                    &mut combatants,
+                    Some(pid.as_str()),
+                    &bp.name,
+                    bp.guild_id.as_deref(),
+                    bp.guild_name.as_deref(),
+                    bp.alliance_id.as_deref(),
+                    bp.alliance_name.as_deref(),
+                    None,
+                    None,
+                    None,
+                    db,
+                );
+                if let Some(c) = combatants.get_mut(&bp.name) {
+                    c.kills += bp.kills.unwrap_or(0);
+                    c.deaths += bp.deaths.unwrap_or(0);
+                }
+            }
+        }
+    }
+
+    let mut combatant_ev_kills: HashMap<String, u32> = HashMap::new();
+    let mut combatant_ev_deaths: HashMap<String, u32> = HashMap::new();
 
     for (idx, (ev, snap_opt)) in merged_events.iter().zip(event_snapshots.iter()).enumerate() {
         let gear_eval = evaluate_equipment(
@@ -326,6 +433,90 @@ fn render_battle_report(
         grand_total_approx |= gear_eval.total_approx;
         grand_inv_approx |= inv_eval.inv_approx;
 
+        upsert_combatant(
+            &mut combatants,
+            ev.killer.id.as_deref(),
+            &ev.killer.name,
+            ev.killer.guild_id.as_deref(),
+            ev.killer.guild_name.as_deref(),
+            ev.killer.alliance_id.as_deref(),
+            ev.killer.alliance_name.as_deref(),
+            ev.killer.equipment.as_ref(),
+            ev.killer.average_item_power,
+            Some(ev.event_id),
+            db,
+        );
+        *combatant_ev_kills
+            .entry(ev.killer.name.clone())
+            .or_default() += 1;
+
+        upsert_combatant(
+            &mut combatants,
+            ev.victim.id.as_deref(),
+            &ev.victim.name,
+            ev.victim.guild_id.as_deref(),
+            ev.victim.guild_name.as_deref(),
+            ev.victim.alliance_id.as_deref(),
+            ev.victim.alliance_name.as_deref(),
+            ev.victim.equipment.as_ref(),
+            ev.victim.average_item_power,
+            Some(ev.event_id),
+            db,
+        );
+        *combatant_ev_deaths
+            .entry(ev.victim.name.clone())
+            .or_default() += 1;
+
+        if let Some(parts) = &ev.participants {
+            for p in parts {
+                upsert_combatant(
+                    &mut combatants,
+                    p.id.as_deref(),
+                    &p.name,
+                    p.guild_id.as_deref(),
+                    p.guild_name.as_deref(),
+                    p.alliance_id.as_deref(),
+                    p.alliance_name.as_deref(),
+                    p.equipment.as_ref(),
+                    p.average_item_power,
+                    Some(ev.event_id),
+                    db,
+                );
+                if let Some(c) = combatants.get_mut(&p.name) {
+                    if p.name != ev.killer.name {
+                        c.assists += 1;
+                    }
+                    let dmg = p.damage_done.unwrap_or(0.0);
+                    let heal = p.support_healing_done.unwrap_or(0.0);
+                    c.total_damage += dmg;
+                    c.total_healing += heal;
+                    if heal > 0.0 {
+                        c.heal_events += 1;
+                        if heal > c.max_single_healing {
+                            c.max_single_healing = heal;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(members) = &ev.group_members {
+            for gm in members {
+                upsert_combatant(
+                    &mut combatants,
+                    gm.id.as_deref(),
+                    &gm.name,
+                    gm.guild_id.as_deref(),
+                    gm.guild_name.as_deref(),
+                    gm.alliance_id.as_deref(),
+                    gm.alliance_name.as_deref(),
+                    gm.equipment.as_ref(),
+                    gm.average_item_power,
+                    Some(ev.event_id),
+                    db,
+                );
+            }
+        }
+
         let rel = classify_relation(
             ev.victim.guild_id.as_deref(),
             ev.victim.guild_name.as_deref(),
@@ -344,6 +535,7 @@ fn render_battle_report(
                 alliance_display: a_disp.clone(),
                 relation: rel,
                 guilds: HashSet::new(),
+                participants: HashSet::new(),
                 deaths: 0,
                 cross_cost: 0,
                 full_cost: 0,
@@ -374,6 +566,7 @@ fn render_battle_report(
                 alliance_display: a_disp.clone(),
                 guild_name: g_label.clone(),
                 relation: rel,
+                participants: HashSet::new(),
                 deaths: 0,
                 cross_cost: 0,
                 full_cost: 0,
@@ -407,6 +600,46 @@ fn render_battle_report(
         });
     }
 
+    for (name, c) in &mut combatants {
+        if let Some(&k) = combatant_ev_kills.get(name) {
+            if k > c.kills {
+                c.kills = k;
+            }
+        }
+        if let Some(&d) = combatant_ev_deaths.get(name) {
+            if d > c.deaths {
+                c.deaths = d;
+            }
+        }
+        let g_label = non_empty(c.guild_name.as_deref())
+            .unwrap_or("[无公会]")
+            .to_string();
+        let a_agg = alliance_losses
+            .entry(c.alliance_key.clone())
+            .or_insert_with(|| AllianceLossAgg {
+                alliance_display: c.alliance_display.clone(),
+                relation: c.relation,
+                guilds: HashSet::new(),
+                participants: HashSet::new(),
+                deaths: 0,
+                cross_cost: 0,
+                full_cost: 0,
+                inv_cost: 0,
+                cross_missing: 0,
+                total_missing: 0,
+                inv_missing: 0,
+                cross_approx: false,
+                total_approx: false,
+                inv_approx: false,
+            });
+        a_agg.guilds.insert(g_label.clone());
+        a_agg.participants.insert(c.name.clone());
+
+        if let Some(g_agg) = guild_losses.get_mut(&(c.alliance_key.clone(), g_label)) {
+            g_agg.participants.insert(c.name.clone());
+        }
+    }
+
     let alliance_rank_val: HashMap<String, u64> = alliance_losses
         .iter()
         .map(|(k, v)| (k.clone(), v.full_cost + v.inv_cost))
@@ -426,9 +659,13 @@ fn render_battle_report(
             })
     });
 
+    let alive_winners_count = combatants.values().filter(|c| c.deaths == 0).count();
+
     println!(
-        "\n{heading}（共 {} 次死亡）   整场十字架: {}   整场全套: {}   整场包内: {}",
+        "\n{heading}（参战 {} 人 | 死亡 {} 次 | 0死存活 {} 人）   整场十字架: {}   整场全套: {}   整场包内: {}",
+        combatants.len(),
         merged_events.len(),
+        alive_winners_count,
         format_cost_text(grand_cross_cost, grand_cross_missing, grand_cross_approx),
         format_cost_text(grand_full_cost, grand_total_missing, grand_total_approx),
         format_cost_text(grand_inv_cost, grand_inv_missing, grand_inv_approx)
@@ -442,8 +679,8 @@ fn render_battle_report(
             hdr("时间", false),
             hdr("阵营", false),
             hdr("联盟", false),
-            hdr("死者 (可点)", false),
-            hdr("击杀者", false),
+            hdr("参战 / 死者 (可点)", false),
+            hdr("击杀者 / 战绩 (可点)", false),
             hdr("十字架", true),
             hdr("全套总价", true),
             hdr("包内价值", true),
@@ -455,8 +692,11 @@ fn render_battle_report(
         for (row_idx, item) in evaluated_events.iter().enumerate() {
             let ev = &merged_events[item.idx_original];
             let killer_tag = format_player_tag(&ev.killer.name, ev.killer.guild_name.as_deref());
+            let killer_linked =
+                player_link(ev.killer.id.as_deref(), Some(ev.event_id), &killer_tag);
             let victim_raw = format_player_tag(&ev.victim.name, ev.victim.guild_name.as_deref());
-            let victim_linked = osc8_link(&killboard_url(ev.event_id), &victim_raw);
+            let victim_linked =
+                player_link(ev.victim.id.as_deref(), Some(ev.event_id), &victim_raw);
 
             let mh_cell = match ev
                 .victim
@@ -470,22 +710,26 @@ fn render_battle_report(
             };
 
             let mut assist_count = 0usize;
-            let mut top_healer: Option<(&str, f64)> = None;
+            let mut top_healer: Option<(&str, Option<&str>, f64)> = None;
             if let Some(parts) = &ev.participants {
                 for p in parts {
                     if p.name != ev.killer.name {
                         assist_count += 1;
                     }
                     let heal = p.support_healing_done.unwrap_or(0.0);
-                    if heal > 0.0 && top_healer.map_or(true, |(_, max_h)| heal > max_h) {
-                        top_healer = Some((p.name.as_str(), heal));
+                    if heal > 0.0 && top_healer.map_or(true, |(_, _, max_h)| heal > max_h) {
+                        let pid_fallback = p.id.as_deref().or_else(|| {
+                            combatants.get(&p.name).and_then(|c| c.player_id.as_deref())
+                        });
+                        top_healer = Some((p.name.as_str(), pid_fallback, heal));
                     }
                 }
             }
 
             let heal_cell = match top_healer {
-                Some((name, val)) => {
-                    Cell::new(format!("{name} ({})", fmt_num(val.round() as u64))).fg(Color::Green)
+                Some((name, pid, val)) => {
+                    let txt = format!("{name} ({})", fmt_num(val.round() as u64));
+                    Cell::new(player_link(pid, Some(ev.event_id), &txt)).fg(Color::Green)
                 }
                 None => Cell::new("-").fg(Color::DarkGrey),
             };
@@ -496,7 +740,7 @@ fn render_battle_report(
                 relation_cell(item.relation),
                 apply_relation_color(Cell::new(&item.alliance_display), item.relation),
                 apply_relation_color(Cell::new(victim_linked), item.relation),
-                Cell::new(killer_tag),
+                Cell::new(killer_linked),
                 format_cost_cell(
                     item.gear_eval.cross_cost,
                     item.gear_eval.cross_missing,
@@ -517,6 +761,56 @@ fn render_battle_report(
                 heal_cell,
             ]);
         }
+
+        // 所有 0 死亡的胜利者放在列表最后
+        let mut alive_winners: Vec<&CombatantStats> =
+            combatants.values().filter(|c| c.deaths == 0).collect();
+        alive_winners.sort_by(|a, b| {
+            a.alliance_key
+                .cmp(&b.alliance_key)
+                .then_with(|| a.guild_name.cmp(&b.guild_name))
+                .then_with(|| (b.kills + b.assists).cmp(&(a.kills + a.assists)))
+                .then_with(|| b.total_healing.total_cmp(&a.total_healing))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        let base_idx = evaluated_events.len();
+        for (offset_idx, c) in alive_winners.iter().enumerate() {
+            let p_raw = format_player_tag(&c.name, c.guild_name.as_deref());
+            let p_linked = player_link(c.player_id.as_deref(), c.sample_event_id, &p_raw);
+            let mh_cell = match c.main_hand.as_deref() {
+                Some(mh) => item_cell(mh, &db.item_names_zh),
+                None => Cell::new("-"),
+            };
+            let record_str = format!(
+                "杀{} 助{} 伤{}",
+                c.kills,
+                c.assists,
+                fmt_num(c.total_damage.round() as u64)
+            );
+            let heal_val = c.total_healing.round() as u64;
+            let heal_cell = if heal_val > 0 {
+                cell_r(fmt_num(heal_val)).fg(Color::Green)
+            } else {
+                Cell::new("-").fg(Color::DarkGrey)
+            };
+
+            deaths_table.add_row(vec![
+                cell_r((base_idx + offset_idx + 1).to_string()),
+                Cell::new("0死(存活)").fg(Color::Green),
+                relation_cell(c.relation),
+                apply_relation_color(Cell::new(&c.alliance_display), c.relation),
+                apply_relation_color(Cell::new(p_linked), c.relation),
+                Cell::new(record_str).fg(Color::DarkGrey),
+                cell_r("0"),
+                cell_r("0"),
+                cell_r("0"),
+                mh_cell,
+                cell_r(c.assists.to_string()),
+                heal_cell,
+            ]);
+        }
+
         println!("{deaths_table}");
     }
 
@@ -535,7 +829,8 @@ fn render_battle_report(
         hdr("阵营", false),
         hdr("联盟", false),
         hdr("公会数", true),
-        hdr("死亡人数", true),
+        hdr("参战", true),
+        hdr("死亡", true),
         hdr("十字架总价", true),
         hdr("全套总价", true),
         hdr("包内总价", true),
@@ -547,6 +842,7 @@ fn render_battle_report(
             relation_cell(a.relation),
             apply_relation_color(Cell::new(&a.alliance_display), a.relation),
             cell_r(a.guilds.len().to_string()),
+            cell_r(a.participants.len().to_string()),
             cell_r(a.deaths.to_string()),
             format_cost_cell(a.cross_cost, a.cross_missing, a.cross_approx),
             format_cost_cell(a.full_cost, a.total_missing, a.total_approx),
@@ -582,7 +878,8 @@ fn render_battle_report(
         hdr("阵营", false),
         hdr("联盟", false),
         hdr("公会", false),
-        hdr("死亡人数", true),
+        hdr("参战", true),
+        hdr("死亡", true),
         hdr("十字架总价", true),
         hdr("全套总价", true),
         hdr("包内总价", true),
@@ -594,6 +891,7 @@ fn render_battle_report(
             relation_cell(g.relation),
             apply_relation_color(Cell::new(&g.alliance_display), g.relation),
             apply_relation_color(Cell::new(&g.guild_name), g.relation),
+            cell_r(g.participants.len().to_string()),
             cell_r(g.deaths.to_string()),
             format_cost_cell(g.cross_cost, g.cross_missing, g.cross_approx),
             format_cost_cell(g.full_cost, g.total_missing, g.total_approx),
@@ -607,18 +905,154 @@ fn render_battle_report(
     }
     println!("{gl_table}");
 
+    // 全场治疗排行榜 & 各联盟治疗实力综合对比
+    let mut healers: Vec<&CombatantStats> = combatants
+        .values()
+        .filter(|c| c.total_healing > 0.0)
+        .collect();
+    healers.sort_by(|a, b| {
+        b.total_healing
+            .total_cmp(&a.total_healing)
+            .then_with(|| b.max_single_healing.total_cmp(&a.max_single_healing))
+    });
+
+    if !healers.is_empty() {
+        let mut alliance_heals: HashMap<String, AllianceHealAgg> = HashMap::new();
+        for h in &healers {
+            let entry = alliance_heals
+                .entry(h.alliance_key.clone())
+                .or_insert_with(|| AllianceHealAgg {
+                    alliance_display: h.alliance_display.clone(),
+                    relation: h.relation,
+                    healer_count: 0,
+                    healer_deaths: 0,
+                    total_healing: 0.0,
+                    top_healer_name: h.name.clone(),
+                    top_healer_val: h.total_healing,
+                });
+            entry.healer_count += 1;
+            if h.deaths > 0 {
+                entry.healer_deaths += 1;
+            }
+            entry.total_healing += h.total_healing;
+            if h.total_healing > entry.top_healer_val {
+                entry.top_healer_val = h.total_healing;
+                entry.top_healer_name = h.name.clone();
+            }
+        }
+
+        let mut ah_list: Vec<AllianceHealAgg> = alliance_heals.into_values().collect();
+        ah_list.sort_by(|a, b| b.total_healing.total_cmp(&a.total_healing));
+
+        println!(
+            "\n各联盟治疗实力综合对比（共 {} 组有治疗产出）\n",
+            ah_list.len()
+        );
+        let mut ah_table = new_clean_table();
+        ah_table.set_header(vec![
+            hdr("排名", true),
+            hdr("阵营", false),
+            hdr("联盟", false),
+            hdr("奶妈数", true),
+            hdr("奶妈阵亡", true),
+            hdr("联盟总治疗", true),
+            hdr("人均治疗", true),
+            hdr("最强奶妈 (总治疗)", false),
+        ]);
+        for (idx, ah) in ah_list.iter().enumerate() {
+            let avg = if ah.healer_count > 0 {
+                (ah.total_healing / ah.healer_count as f64).round() as u64
+            } else {
+                0
+            };
+            ah_table.add_row(vec![
+                cell_r((idx + 1).to_string()),
+                relation_cell(ah.relation),
+                apply_relation_color(Cell::new(&ah.alliance_display), ah.relation),
+                cell_r(ah.healer_count.to_string()),
+                if ah.healer_deaths > 0 {
+                    cell_r(ah.healer_deaths.to_string()).fg(Color::Red)
+                } else {
+                    cell_r("0")
+                },
+                cell_r(fmt_num(ah.total_healing.round() as u64)).fg(Color::Green),
+                cell_r(fmt_num(avg)),
+                Cell::new(format!(
+                    "{} ({})",
+                    ah.top_healer_name,
+                    fmt_num(ah.top_healer_val.round() as u64)
+                )),
+            ]);
+        }
+        println!("{ah_table}");
+
+        let show_limit = if show_all_details {
+            healers.len()
+        } else {
+            25.min(healers.len())
+        };
+        println!(
+            "\n全场治疗排行榜（前 {} / 共 {} 位奶妈，名字可点看配装）\n",
+            show_limit,
+            healers.len()
+        );
+        let mut h_table = new_clean_table();
+        h_table.set_header(vec![
+            hdr("排名", true),
+            hdr("阵营", false),
+            hdr("联盟", false),
+            hdr("治疗者 (可点)", false),
+            hdr("治疗武器", false),
+            hdr("IP", true),
+            hdr("死亡", true),
+            hdr("有效参与", true),
+            hdr("累计治疗量", true),
+            hdr("单次最高", true),
+        ]);
+        for (idx, h) in healers.iter().take(show_limit).enumerate() {
+            let p_raw = format_player_tag(&h.name, h.guild_name.as_deref());
+            let p_linked = player_link(h.player_id.as_deref(), h.sample_event_id, &p_raw);
+            let mh_cell = match h.main_hand.as_deref() {
+                Some(mh) => item_cell(mh, &db.item_names_zh),
+                None => Cell::new("-"),
+            };
+            let ip = h
+                .avg_ip
+                .map(|v| format!("{v:.0}"))
+                .unwrap_or_else(|| "-".to_string());
+            h_table.add_row(vec![
+                cell_r((idx + 1).to_string()),
+                relation_cell(h.relation),
+                apply_relation_color(Cell::new(&h.alliance_display), h.relation),
+                apply_relation_color(Cell::new(p_linked), h.relation),
+                mh_cell,
+                cell_r(ip),
+                if h.deaths > 0 {
+                    cell_r(h.deaths.to_string()).fg(Color::Red)
+                } else {
+                    cell_r("0")
+                },
+                cell_r(h.heal_events.to_string()),
+                cell_r(fmt_num(h.total_healing.round() as u64)).fg(Color::Green),
+                cell_r(fmt_num(h.max_single_healing.round() as u64)),
+            ]);
+        }
+        println!("{h_table}");
+    }
+
     // 我方公会参战名单
     let mut guild_roster: HashMap<String, GuildMemberStats> = HashMap::new();
     for sb in stored_battles {
         let mut attended_this = HashSet::new();
         if let Some(players) = &sb.summary.players {
-            for bp in players.values() {
+            for (pid, bp) in players {
                 if is_my_guild(bp.guild_id.as_deref(), bp.guild_name.as_deref()) {
                     attended_this.insert(bp.name.clone());
                     let entry =
                         guild_roster
                             .entry(bp.name.clone())
                             .or_insert_with(|| GuildMemberStats {
+                                player_id: Some(pid.clone()),
                                 name: bp.name.clone(),
                                 ..Default::default()
                             });
@@ -645,6 +1079,7 @@ fn render_battle_report(
             let entry = guild_roster
                 .entry(ev.killer.name.clone())
                 .or_insert_with(|| GuildMemberStats {
+                    player_id: ev.killer.id.clone(),
                     name: ev.killer.name.clone(),
                     ..Default::default()
                 });
@@ -661,6 +1096,7 @@ fn render_battle_report(
             let entry = guild_roster
                 .entry(ev.victim.name.clone())
                 .or_insert_with(|| GuildMemberStats {
+                    player_id: ev.victim.id.clone(),
                     name: ev.victim.name.clone(),
                     ..Default::default()
                 });
@@ -702,6 +1138,7 @@ fn render_battle_report(
                         guild_roster
                             .entry(p.name.clone())
                             .or_insert_with(|| GuildMemberStats {
+                                player_id: p.id.clone(),
                                 name: p.name.clone(),
                                 ..Default::default()
                             });
@@ -721,6 +1158,7 @@ fn render_battle_report(
                         guild_roster
                             .entry(gm.name.clone())
                             .or_insert_with(|| GuildMemberStats {
+                                player_id: gm.id.clone(),
                                 name: gm.name.clone(),
                                 ..Default::default()
                             });
@@ -731,6 +1169,9 @@ fn render_battle_report(
     }
 
     for (name, stats) in &mut guild_roster {
+        if stats.player_id.is_none() {
+            stats.player_id = combatants.get(name).and_then(|c| c.player_id.clone());
+        }
         let ev_deaths = stats.death_records.len() as u32;
         if ev_deaths > stats.deaths {
             stats.deaths = ev_deaths;
@@ -816,12 +1257,12 @@ fn render_battle_report(
                 cell_r("0")
             };
 
-            let player_cell = if let Some(first_death) = p.death_records.first() {
-                Cell::new(osc8_link(&killboard_url(first_death.event_id), &p.name))
-                    .add_attribute(Attribute::Bold)
-            } else {
-                Cell::new(&p.name).add_attribute(Attribute::Bold)
-            };
+            let linked_name = player_link(
+                p.player_id.as_deref(),
+                p.death_records.first().map(|d| d.event_id),
+                &p.name,
+            );
+            let player_cell = Cell::new(linked_name).add_attribute(Attribute::Bold);
 
             let mut row = vec![cell_r((idx + 1).to_string()), player_cell];
             if stored_battles.len() > 1 {

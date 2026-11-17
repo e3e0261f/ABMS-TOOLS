@@ -34,7 +34,6 @@ pub struct PriceRecord {
 pub struct StoredBattle {
     pub summary: BattleSummary,
     pub events: Vec<KillEvent>,
-    /// 本场战斗独立冻结的价格快照（防止未来物价波动改写历史账本）
     #[serde(default)]
     pub price_snapshot: HashMap<String, PriceRecord>,
     #[serde(default)]
@@ -106,6 +105,7 @@ pub struct KillEvent {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
 pub struct EventPlayer {
+    pub id: Option<String>,
     pub name: String,
     pub guild_id: Option<String>,
     pub guild_name: Option<String>,
@@ -119,9 +119,12 @@ pub struct EventPlayer {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
 pub struct Participant {
+    pub id: Option<String>,
     pub name: String,
     pub guild_id: Option<String>,
     pub guild_name: Option<String>,
+    pub alliance_id: Option<String>,
+    pub alliance_name: Option<String>,
     pub average_item_power: Option<f64>,
     pub damage_done: Option<f64>,
     pub support_healing_done: Option<f64>,
@@ -257,6 +260,7 @@ pub struct AllianceLossAgg {
     pub alliance_display: String,
     pub relation: Relation,
     pub guilds: HashSet<String>,
+    pub participants: HashSet<String>,
     pub deaths: u32,
     pub cross_cost: u64,
     pub full_cost: u64,
@@ -275,6 +279,7 @@ pub struct GuildLossAgg {
     pub alliance_display: String,
     pub guild_name: String,
     pub relation: Relation,
+    pub participants: HashSet<String>,
     pub deaths: u32,
     pub cross_cost: u64,
     pub full_cost: u64,
@@ -289,6 +294,7 @@ pub struct GuildLossAgg {
 
 #[derive(Debug, Default)]
 pub struct GuildMemberStats {
+    pub player_id: Option<String>,
     pub name: String,
     pub battles_attended: u32,
     pub deaths: u32,
@@ -318,4 +324,38 @@ pub struct EvaluatedEvent {
     pub guild_label: String,
     pub gear_eval: GearEval,
     pub inv_eval: InvEval,
+}
+
+#[derive(Debug, Clone)]
+pub struct CombatantStats {
+    pub player_id: Option<String>,
+    pub name: String,
+    pub guild_id: Option<String>,
+    pub guild_name: Option<String>,
+    pub alliance_id: Option<String>,
+    pub alliance_name: Option<String>,
+    pub relation: Relation,
+    pub alliance_key: String,
+    pub alliance_display: String,
+    pub kills: u32,
+    pub assists: u32,
+    pub deaths: u32,
+    pub heal_events: u32,
+    pub total_damage: f64,
+    pub total_healing: f64,
+    pub max_single_healing: f64,
+    pub main_hand: Option<String>,
+    pub avg_ip: Option<f64>,
+    pub sample_event_id: Option<u64>,
+}
+
+#[derive(Debug)]
+pub struct AllianceHealAgg {
+    pub alliance_display: String,
+    pub relation: Relation,
+    pub healer_count: u32,
+    pub healer_deaths: u32,
+    pub total_healing: f64,
+    pub top_healer_name: String,
+    pub top_healer_val: f64,
 }
